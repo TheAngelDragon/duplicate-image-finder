@@ -1,0 +1,395 @@
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QComboBox, QProgressBar, QFileDialog, QSplitter,
+    QListWidget, QListWidgetItem, QMessageBox, QSpinBox,
+    QGroupBox, QFormLayout
+)
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QPixmap, QImage
+from pathlib import Path
+import io
+from PIL import Image
+from functions import (
+    get_image_files, scan_exact, scan_similar,
+    delete_file, open_file_location
+)
+
+
+class ScanWorker(QThread):
+    progress = Signal(int, int)
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, directory, mode, threshold=8):
+        super().__init__()
+        self.directory = directory
+        self.mode = mode
+        self.threshold = threshold
+
+    def run(self):
+        try:
+            files = get_image_files(self.directory)
+            if not files:
+                self.finished.emit([])
+                return
+
+            def cb(current, total):
+                self.progress.emit(current, total)
+
+            if self.mode == "quick":
+                groups = scan_exact(files, cb)
+            else:
+                groups = scan_similar(files, self.threshold, cb)
+
+            self.finished.emit(groups)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Duplicate Image Finder")
+        self.resize(1200, 800)
+        self.groups = []
+        self.current_group = None
+        self.current_index = 0
+
+        self._apply_theme()
+        self._build_ui()
+
+    def _apply_theme(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #FFFFFF;
+                color: #0C2340;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 13px;
+            }
+            QPushButton {
+                background-color: #4169E1;          /* Lighter Royal Blue */
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #5A82F0;
+            }
+            QPushButton:pressed {
+                background-color: #2E4DB8;
+            }
+            QPushButton#deleteBtn {
+                background-color: #C0392B;
+            }
+            QPushButton#deleteBtn:hover {
+                background-color: #E74C3C;
+            }
+            QComboBox, QSpinBox {
+                border: 1px solid #4169E1;
+                border-radius: 4px;
+                padding: 4px;
+                background: white;
+            }
+            QProgressBar {
+                border: 1px solid #4169E1;
+                border-radius: 6px;
+                text-align: center;
+                height: 22px;
+            }
+            QProgressBar::chunk {
+                background-color: #C9A227;
+                border-radius: 5px;
+            }
+            QListWidget {
+                border: 1px solid #D0D0D0;
+                border-radius: 6px;
+                background: #FAFAFA;
+            }
+            QListWidget::item:selected {
+                background-color: #4169E1;
+                color: white;
+            }
+            QGroupBox {
+                border: 1px solid #C9A227;
+                border-radius: 6px;
+                margin-top: 10px;
+                font-weight: bold;
+                color: #0C2340;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(16, 16, 16, 16)
+        main_layout.setSpacing(12)
+
+        # Top controls
+        top = QHBoxLayout()
+        self.btn_folder = QPushButton("Select Folder")
+        self.btn_folder.clicked.connect(self.select_folder)
+        self.lbl_folder = QLabel("No folder selected")
+        self.lbl_folder.setStyleSheet("color: #555;")
+
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["Quick Scan (Exact Matches)", "Deep Scan (Similar Images)"])
+        self.combo_mode.currentIndexChanged.connect(self._toggle_threshold)
+
+        self.spin_threshold = QSpinBox()
+        self.spin_threshold.setRange(0, 20)
+        self.spin_threshold.setValue(8)
+        self.spin_threshold.setPrefix("Threshold: ")
+        self.spin_threshold.setVisible(False)
+
+        self.btn_scan = QPushButton("Start Scan")
+        self.btn_scan.clicked.connect(self.start_scan)
+        self.btn_scan.setEnabled(False)
+
+        top.addWidget(self.btn_folder)
+        top.addWidget(self.lbl_folder, 1)
+        top.addWidget(self.combo_mode)
+        top.addWidget(self.spin_threshold)
+        top.addWidget(self.btn_scan)
+        main_layout.addLayout(top)
+
+        # Progress
+        prog_layout = QHBoxLayout()
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+        self.lbl_progress = QLabel("0 / 0")
+        prog_layout.addWidget(self.progress, 1)
+        prog_layout.addWidget(self.lbl_progress)
+        main_layout.addLayout(prog_layout)
+
+        # Splitter
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left: groups
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.addWidget(QLabel("<b>Duplicate Groups</b>"))
+        self.list_groups = QListWidget()
+        self.list_groups.itemClicked.connect(self.on_group_selected)
+        left_layout.addWidget(self.list_groups)
+        splitter.addWidget(left_widget)
+
+        # Right: preview + files in group
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        self.lbl_preview = QLabel("Select a group to preview")
+        self.lbl_preview.setAlignment(Qt.AlignCenter)
+        self.lbl_preview.setMinimumHeight(360)
+        self.lbl_preview.setStyleSheet("border: 2px solid #C9A227; border-radius: 8px; background: #F8F8F8;")
+        right_layout.addWidget(self.lbl_preview)
+
+        info_group = QGroupBox("Selected File")
+        info_layout = QFormLayout()
+        self.lbl_name = QLabel("-")
+        self.lbl_size = QLabel("-")
+        self.lbl_sim = QLabel("-")
+        self.lbl_path = QLabel("-")
+        self.lbl_path.setWordWrap(True)
+        info_layout.addRow("Name:", self.lbl_name)
+        info_layout.addRow("Size:", self.lbl_size)
+        info_layout.addRow("Match:", self.lbl_sim)
+        info_layout.addRow("Path:", self.lbl_path)
+        info_group.setLayout(info_layout)
+        right_layout.addWidget(info_group)
+
+        right_layout.addWidget(QLabel("<b>Files in Group</b> (click to preview)"))
+        self.list_files = QListWidget()
+        self.list_files.itemClicked.connect(self.on_file_selected)
+        right_layout.addWidget(self.list_files)
+
+        # Action buttons (hidden by default)
+        btn_layout = QHBoxLayout()
+        self.btn_open = QPushButton("Open Location")
+        self.btn_open.clicked.connect(self.open_location)
+        self.btn_delete = QPushButton("Delete")
+        self.btn_delete.setObjectName("deleteBtn")
+        self.btn_delete.clicked.connect(self.delete_current)
+
+        self.btn_open.setVisible(False)
+        self.btn_delete.setVisible(False)
+
+        btn_layout.addWidget(self.btn_open)
+        btn_layout.addWidget(self.btn_delete)
+        right_layout.addLayout(btn_layout)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([350, 850])
+        main_layout.addWidget(splitter, 1)
+
+        self.folder_path = None
+
+    def _toggle_threshold(self):
+        is_deep = self.combo_mode.currentIndex() == 1
+        self.spin_threshold.setVisible(is_deep)
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
+        if folder:
+            self.folder_path = folder
+            self.lbl_folder.setText(folder)
+            self.btn_scan.setEnabled(True)
+
+    def start_scan(self):
+        if not self.folder_path:
+            return
+
+        self.btn_scan.setEnabled(False)
+        self.list_groups.clear()
+        self.list_files.clear()
+        self.lbl_preview.clear()
+        self.lbl_preview.setText("Scanning...")
+        self.groups = []
+        self._hide_action_buttons()
+
+        mode = "quick" if self.combo_mode.currentIndex() == 0 else "deep"
+        threshold = self.spin_threshold.value()
+
+        self.worker = ScanWorker(self.folder_path, mode, threshold)
+        self.worker.progress.connect(self.update_progress)
+        self.worker.finished.connect(self.scan_finished)
+        self.worker.error.connect(self.scan_error)
+        self.worker.start()
+
+    def update_progress(self, current, total):
+        self.progress.setMaximum(total)
+        self.progress.setValue(current)
+        self.lbl_progress.setText(f"{current} / {total}")
+
+    def scan_finished(self, groups):
+        self.groups = groups
+        self.btn_scan.setEnabled(True)
+        self.progress.setValue(self.progress.maximum())
+        self.populate_groups()
+        if not groups:
+            self.lbl_preview.setText("No duplicates found")
+            QMessageBox.information(self, "Done", "No duplicate images found.")
+
+    def scan_error(self, msg):
+        self.btn_scan.setEnabled(True)
+        QMessageBox.critical(self, "Error", msg)
+
+    def populate_groups(self):
+        self.list_groups.clear()
+        for i, group in enumerate(self.groups):
+            avg_sim = sum(f["similarity"] for f in group) / len(group)
+            item = QListWidgetItem(f"Group {i+1}  •  {len(group)} files  •  ~{avg_sim:.1f}%")
+            item.setData(Qt.UserRole, i)
+            self.list_groups.addItem(item)
+
+    def on_group_selected(self, item):
+        idx = item.data(Qt.UserRole)
+        self.current_group = self.groups[idx]
+        self.current_index = 0
+        self.populate_file_list()
+        self.show_preview(0)
+
+    def populate_file_list(self):
+        self.list_files.clear()
+        if not self.current_group:
+            return
+        for f in self.current_group:
+            text = f"{f['path'].name}  •  {f['size_str']}  •  {f['similarity']:.1f}%"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, f)
+            self.list_files.addItem(item)
+
+    def on_file_selected(self, item):
+        data = item.data(Qt.UserRole)
+        for i, f in enumerate(self.current_group):
+            if f["path"] == data["path"]:
+                self.show_preview(i)
+                break
+
+    def show_preview(self, index: int):
+        if not self.current_group or index >= len(self.current_group):
+            self._hide_action_buttons()
+            return
+
+        self.current_index = index
+        info = self.current_group[index]
+
+        self.lbl_name.setText(info["path"].name)
+        self.lbl_size.setText(info["size_str"])
+        self.lbl_sim.setText(f"{info['similarity']:.1f}%")
+        self.lbl_path.setText(str(info["path"]))
+
+        self.list_files.setCurrentRow(index)
+        self._show_action_buttons()
+
+        try:
+            with Image.open(info["path"]) as img:
+                img = img.convert("RGB")
+                img.thumbnail((800, 600), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                qimg = QImage.fromData(buf.getvalue())
+                pixmap = QPixmap.fromImage(qimg)
+                self.lbl_preview.setPixmap(pixmap.scaled(
+                    self.lbl_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                ))
+        except Exception as e:
+            self.lbl_preview.setText(f"Preview error:\n{e}")
+
+    def _show_action_buttons(self):
+        self.btn_open.setVisible(True)
+        self.btn_delete.setVisible(True)
+
+    def _hide_action_buttons(self):
+        self.btn_open.setVisible(False)
+        self.btn_delete.setVisible(False)
+
+    def open_location(self):
+        if not self.current_group:
+            return
+        path = self.current_group[self.current_index]["path"]
+        open_file_location(path)
+
+    def delete_current(self):
+        if not self.current_group:
+            return
+        info = self.current_group[self.current_index]
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Permanently delete:\n{info['path'].name}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        success, message = delete_file(info["path"])
+        if not success:
+            QMessageBox.warning(self, "Error", f"Could not delete file:\n{message}")
+            return
+
+        # Remove from group
+        self.current_group.pop(self.current_index)
+
+        if len(self.current_group) < 2:
+            group_idx = self.list_groups.currentRow()
+            if group_idx >= 0:
+                self.groups.pop(group_idx)
+            self.current_group = None
+            self.list_files.clear()
+            self.lbl_preview.clear()
+            self.lbl_preview.setText("Group removed")
+            self._hide_action_buttons()
+            self.populate_groups()
+            return
+
+        self.populate_file_list()
+        new_index = min(self.current_index, len(self.current_group) - 1)
+        self.show_preview(new_index)
+        self.populate_groups()
