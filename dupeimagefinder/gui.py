@@ -1,17 +1,17 @@
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QComboBox, QProgressBar, QFileDialog, QSplitter,
-    QListWidget, QListWidgetItem, QMessageBox, QSpinBox,
+    QListWidget, QListWidgetItem, QMessageBox, QSlider,
     QGroupBox, QFormLayout
 )
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtCore import Qt, QThread, Signal, QUrl
+from PySide6.QtGui import QPixmap, QImage, QDesktopServices
 from pathlib import Path
 import io
 from PIL import Image
 from functions import (
     get_image_files, scan_exact, scan_similar,
-    delete_file, open_file_location
+    delete_file
 )
 
 
@@ -25,25 +25,34 @@ class ScanWorker(QThread):
         self.directory = directory
         self.mode = mode
         self.threshold = threshold
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def is_cancelled(self):
+        return self._cancelled
 
     def run(self):
         try:
             files = get_image_files(self.directory)
-            if not files:
+            if not files or self.is_cancelled():
                 self.finished.emit([])
                 return
 
             def cb(current, total):
-                self.progress.emit(current, total)
+                if not self.is_cancelled():
+                    self.progress.emit(current, total)
 
             if self.mode == "quick":
-                groups = scan_exact(files, cb)
+                groups = scan_exact(files, cb, self.is_cancelled)
             else:
-                groups = scan_similar(files, self.threshold, cb)
+                groups = scan_similar(files, self.threshold, cb, self.is_cancelled)
 
-            self.finished.emit(groups)
+            self.finished.emit(groups if not self.is_cancelled() else [])
         except Exception as e:
-            self.error.emit(str(e))
+            if not self.is_cancelled():
+                self.error.emit(str(e))
 
 
 class MainWindow(QMainWindow):
@@ -54,6 +63,7 @@ class MainWindow(QMainWindow):
         self.groups = []
         self.current_group = None
         self.current_index = 0
+        self.worker = None
 
         self._apply_theme()
         self._build_ui()
@@ -67,7 +77,7 @@ class MainWindow(QMainWindow):
                 font-size: 13px;
             }
             QPushButton {
-                background-color: #4169E1;          /* Lighter Royal Blue */
+                background-color: #4169E1;
                 color: white;
                 border: none;
                 border-radius: 6px;
@@ -86,11 +96,15 @@ class MainWindow(QMainWindow):
             QPushButton#deleteBtn:hover {
                 background-color: #E74C3C;
             }
-            QComboBox, QSpinBox {
+            QPushButton#cancelBtn {
+                background-color: #E67E22;
+            }
+            QPushButton#cancelBtn:hover {
+                background-color: #F39C12;
+            }
+            QComboBox, QSlider {
                 border: 1px solid #4169E1;
                 border-radius: 4px;
-                padding: 4px;
-                background: white;
             }
             QProgressBar {
                 border: 1px solid #4169E1;
@@ -143,20 +157,26 @@ class MainWindow(QMainWindow):
         self.combo_mode.addItems(["Quick Scan (Exact Matches)", "Deep Scan (Similar Images)"])
         self.combo_mode.currentIndexChanged.connect(self._toggle_threshold)
 
-        self.spin_threshold = QSpinBox()
-        self.spin_threshold.setRange(0, 20)
-        self.spin_threshold.setValue(8)
-        self.spin_threshold.setPrefix("Threshold: ")
-        self.spin_threshold.setVisible(False)
+        # Threshold slider
+        self.slider_threshold = QSlider(Qt.Horizontal)
+        self.slider_threshold.setRange(0, 20)
+        self.slider_threshold.setValue(8)
+        self.slider_threshold.setTickPosition(QSlider.TicksBelow)
+        self.slider_threshold.setTickInterval(2)
+        self.slider_threshold.valueChanged.connect(self._update_threshold_label)
+        self.lbl_threshold = QLabel("Threshold: 8")
+        self.slider_threshold.setVisible(False)
+        self.lbl_threshold.setVisible(False)
 
         self.btn_scan = QPushButton("Start Scan")
-        self.btn_scan.clicked.connect(self.start_scan)
+        self.btn_scan.clicked.connect(self.start_or_cancel_scan)
         self.btn_scan.setEnabled(False)
 
         top.addWidget(self.btn_folder)
         top.addWidget(self.lbl_folder, 1)
         top.addWidget(self.combo_mode)
-        top.addWidget(self.spin_threshold)
+        top.addWidget(self.lbl_threshold)
+        top.addWidget(self.slider_threshold)
         top.addWidget(self.btn_scan)
         main_layout.addLayout(top)
 
@@ -172,7 +192,6 @@ class MainWindow(QMainWindow):
         # Splitter
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: groups
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.addWidget(QLabel("<b>Duplicate Groups</b>"))
@@ -181,7 +200,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.list_groups)
         splitter.addWidget(left_widget)
 
-        # Right: preview + files in group
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
 
@@ -195,11 +213,13 @@ class MainWindow(QMainWindow):
         info_layout = QFormLayout()
         self.lbl_name = QLabel("-")
         self.lbl_size = QLabel("-")
+        self.lbl_modified = QLabel("-")
         self.lbl_sim = QLabel("-")
         self.lbl_path = QLabel("-")
         self.lbl_path.setWordWrap(True)
         info_layout.addRow("Name:", self.lbl_name)
         info_layout.addRow("Size:", self.lbl_size)
+        info_layout.addRow("Modified:", self.lbl_modified)
         info_layout.addRow("Match:", self.lbl_sim)
         info_layout.addRow("Path:", self.lbl_path)
         info_group.setLayout(info_layout)
@@ -210,17 +230,14 @@ class MainWindow(QMainWindow):
         self.list_files.itemClicked.connect(self.on_file_selected)
         right_layout.addWidget(self.list_files)
 
-        # Action buttons (hidden by default)
         btn_layout = QHBoxLayout()
         self.btn_open = QPushButton("Open Location")
         self.btn_open.clicked.connect(self.open_location)
         self.btn_delete = QPushButton("Delete")
         self.btn_delete.setObjectName("deleteBtn")
         self.btn_delete.clicked.connect(self.delete_current)
-
         self.btn_open.setVisible(False)
         self.btn_delete.setVisible(False)
-
         btn_layout.addWidget(self.btn_open)
         btn_layout.addWidget(self.btn_delete)
         right_layout.addLayout(btn_layout)
@@ -231,9 +248,13 @@ class MainWindow(QMainWindow):
 
         self.folder_path = None
 
+    def _update_threshold_label(self, value):
+        self.lbl_threshold.setText(f"Threshold: {value}")
+
     def _toggle_threshold(self):
         is_deep = self.combo_mode.currentIndex() == 1
-        self.spin_threshold.setVisible(is_deep)
+        self.slider_threshold.setVisible(is_deep)
+        self.lbl_threshold.setVisible(is_deep)
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Folder to Scan")
@@ -242,26 +263,39 @@ class MainWindow(QMainWindow):
             self.lbl_folder.setText(folder)
             self.btn_scan.setEnabled(True)
 
+    def start_or_cancel_scan(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_scan()
+        else:
+            self.start_scan()
+
     def start_scan(self):
         if not self.folder_path:
             return
 
-        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("Cancel")
+        self.btn_scan.setObjectName("cancelBtn")
+        self.btn_scan.setStyleSheet("")  # force style refresh
         self.list_groups.clear()
         self.list_files.clear()
-        self.lbl_preview.clear()
         self.lbl_preview.setText("Scanning...")
         self.groups = []
         self._hide_action_buttons()
 
         mode = "quick" if self.combo_mode.currentIndex() == 0 else "deep"
-        threshold = self.spin_threshold.value()
+        threshold = self.slider_threshold.value()
 
         self.worker = ScanWorker(self.folder_path, mode, threshold)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.scan_finished)
         self.worker.error.connect(self.scan_error)
         self.worker.start()
+
+    def cancel_scan(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.lbl_preview.setText("Cancelling...")
+            self.btn_scan.setEnabled(False)
 
     def update_progress(self, current, total):
         self.progress.setMaximum(total)
@@ -270,16 +304,26 @@ class MainWindow(QMainWindow):
 
     def scan_finished(self, groups):
         self.groups = groups
-        self.btn_scan.setEnabled(True)
+        self._reset_scan_button()
         self.progress.setValue(self.progress.maximum())
         self.populate_groups()
         if not groups:
-            self.lbl_preview.setText("No duplicates found")
-            QMessageBox.information(self, "Done", "No duplicate images found.")
+            self.lbl_preview.setText("Scan cancelled" if self.worker and self.worker.is_cancelled() else "No duplicates found")
+            if not (self.worker and self.worker.is_cancelled()):
+                QMessageBox.information(self, "Done", "No duplicate images found.")
+        else:
+            if not (self.worker and self.worker.is_cancelled()):
+                QMessageBox.information(self, "Scan finished!", f"Found {len(groups)} groups of duplicate images.")
 
     def scan_error(self, msg):
-        self.btn_scan.setEnabled(True)
+        self._reset_scan_button()
         QMessageBox.critical(self, "Error", msg)
+
+    def _reset_scan_button(self):
+        self.btn_scan.setText("Start Scan")
+        self.btn_scan.setObjectName("")
+        self.btn_scan.setEnabled(True)
+        self.btn_scan.setStyleSheet("")
 
     def populate_groups(self):
         self.list_groups.clear()
@@ -301,7 +345,7 @@ class MainWindow(QMainWindow):
         if not self.current_group:
             return
         for f in self.current_group:
-            text = f"{f['path'].name}  •  {f['size_str']}  •  {f['similarity']:.1f}%"
+            text = f"{f['path'].name}  •  {f['size_str']}  •  {f['modified']}  •  {f['similarity']:.1f}%"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, f)
             self.list_files.addItem(item)
@@ -323,6 +367,7 @@ class MainWindow(QMainWindow):
 
         self.lbl_name.setText(info["path"].name)
         self.lbl_size.setText(info["size_str"])
+        self.lbl_modified.setText(info.get("modified", "Unknown"))
         self.lbl_sim.setText(f"{info['similarity']:.1f}%")
         self.lbl_path.setText(str(info["path"]))
 
@@ -355,7 +400,10 @@ class MainWindow(QMainWindow):
         if not self.current_group:
             return
         path = self.current_group[self.current_index]["path"]
-        open_file_location(path)
+        self._open_file_location(path)
+
+    def _open_file_location(path: Path):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))  
 
     def delete_current(self):
         if not self.current_group:
@@ -374,7 +422,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", f"Could not delete file:\n{message}")
             return
 
-        # Remove from group
         self.current_group.pop(self.current_index)
 
         if len(self.current_group) < 2:
@@ -383,7 +430,6 @@ class MainWindow(QMainWindow):
                 self.groups.pop(group_idx)
             self.current_group = None
             self.list_files.clear()
-            self.lbl_preview.clear()
             self.lbl_preview.setText("Group removed")
             self._hide_action_buttons()
             self.populate_groups()

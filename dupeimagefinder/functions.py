@@ -3,7 +3,7 @@ from PIL import Image
 import imagehash
 import hashlib
 from pillow_heif import register_heif_opener
-import os
+from datetime import datetime
 
 register_heif_opener()
 
@@ -33,6 +33,14 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def format_mtime(path: Path) -> str:
+    try:
+        mtime = path.stat().st_mtime
+        return datetime.fromtimestamp(mtime).strftime("%d-%m-%Y %H:%M")
+    except OSError:
+        return "Unknown"
+
+
 def similarity_percent(hash1, hash2, bits: int = 64) -> float:
     if hash1 is None or hash2 is None:
         return 0.0
@@ -40,11 +48,14 @@ def similarity_percent(hash1, hash2, bits: int = 64) -> float:
     return round(100 * (1 - distance / bits), 1)
 
 
-def scan_exact(files: list[Path], progress_callback=None):
+def scan_exact(files: list[Path], progress_callback=None, cancel_check=None):
     hash_groups = {}
     total = len(files)
 
     for i, path in enumerate(files):
+        if cancel_check and cancel_check():
+            return []
+
         try:
             h = hashlib.md5()
             with path.open("rb") as f:
@@ -67,6 +78,7 @@ def scan_exact(files: list[Path], progress_callback=None):
                     "path": p,
                     "size": get_file_size(p),
                     "size_str": format_size(get_file_size(p)),
+                    "modified": format_mtime(p),
                     "similarity": 100.0,
                     "hash": None
                 })
@@ -74,11 +86,14 @@ def scan_exact(files: list[Path], progress_callback=None):
     return groups
 
 
-def scan_similar(files: list[Path], threshold: int = 8, progress_callback=None):
+def scan_similar(files: list[Path], threshold: int = 8, progress_callback=None, cancel_check=None):
     groups = []
     total = len(files)
 
     for i, path in enumerate(files):
+        if cancel_check and cancel_check():
+            return []
+
         try:
             with Image.open(path) as img:
                 img = img.convert("RGB")
@@ -95,6 +110,7 @@ def scan_similar(files: list[Path], threshold: int = 8, progress_callback=None):
                         "path": path,
                         "size": get_file_size(path),
                         "size_str": format_size(get_file_size(path)),
+                        "modified": format_mtime(path),
                         "similarity": sim,
                         "hash": h
                     })
@@ -108,6 +124,7 @@ def scan_similar(files: list[Path], threshold: int = 8, progress_callback=None):
                         "path": path,
                         "size": get_file_size(path),
                         "size_str": format_size(get_file_size(path)),
+                        "modified": format_mtime(path),
                         "similarity": 100.0,
                         "hash": h
                     }]
@@ -128,9 +145,4 @@ def delete_file(path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
-
 def open_file_location(path: Path):
-    """Opens the folder containing the file in the system file explorer"""
-    from PySide6.QtCore import QUrl
-    from PySide6.QtGui import QDesktopServices
-    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
