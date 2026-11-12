@@ -136,13 +136,10 @@ def scan_similar(files: list[Path], threshold: int = 8, progress_callback=None, 
     return [g["files"] for g in groups if len(g["files"]) > 1]
 
 
-# ====================== Button Actions ======================
 def delete_file(path: Path) -> tuple[bool, str]:
-    """Deletes a file. Returns (success, message)"""
     try:
         path.unlink()
         return True, "Deleted successfully"
     except Exception as e:
         return False, str(e)
 
-def open_file_location(path: Path):
