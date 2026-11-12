@@ -86,7 +86,7 @@ def scan_exact(files: list[Path], progress_callback=None, cancel_check=None):
     return groups
 
 
-def scan_similar(files: list[Path], threshold: int = 12, progress_callback=None, cancel_check=None):
+def scan_similar(files: list[Path], threshold: int = 8, progress_callback=None, cancel_check=None):
     groups = []
     total = len(files)
 

@@ -1,0 +1,5 @@
+ImageHash==4.3.2
+pillow==13.0.0
+pillow_heif==1.8.1
+PySide6==6.12.0
+
